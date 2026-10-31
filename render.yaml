@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: aurelia-wealth-api
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    preDeployCommand: alembic upgrade head
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health/ready
+    autoDeploy: true
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DATABASE_URL
+        fromDatabase:
+          name: aurelia-wealth-db
+          property: connectionString
+      - key: BOOTSTRAP_ADMIN_EMAIL
+        sync: false
+      - key: BOOTSTRAP_ADMIN_PASSWORD
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
+      - key: MARKET_DATA_STALE_MINUTES
+        value: "1440"
+databases:
+  - name: aurelia-wealth-db
+    databaseName: aurelia_wealth
+    user: aurelia_wealth_user
+    plan: basic-256mb
