@@ -1265,11 +1265,9 @@ def main():
     # cannot trigger database initialization through the UI.
     try:
         init_database()
-    except Exception:
-        st.error(
-            "Cannot connect to PostgreSQL. Verify DATABASE_URL and "
-            "confirm the database is reachable."
-        )
+    except Exception as exc:
+        st.error(f"Database connection failed: {type(exc).__name__}")
+        st.code(str(exc))
         st.stop()
 
     with st.sidebar:
