@@ -307,31 +307,208 @@ def fetch_info(sym):
 
 
 def refresh_market_data():
+    """
+    Refresh prices and metadata for stocks held by active clients.
+
+    - Runs only for an authenticated administrator.
+    - Updates only valid, positive prices.
+    - Keeps previously cached prices when downloads fail.
+    - Saves successful prices and the audit entry in one transaction.
+    - Updates session history only after the database transaction succeeds.
+    """
     if not authed():
         raise PermissionError("Authentication required.")
+
     df = load_positions()
-    syms = sorted(set(df.sym))
+    syms = sorted(set(df["sym"].dropna().astype(str)))
+
     if not syms:
-        return dict(ok=0, missing=[])
-    closes = download_closes(syms + list(BENCHMARKS.values()))
-    valid = [s for s in syms if s in closes and closes[s].notna().any()]
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        infos = dict(zip(valid, executor.map(fetch_info, valid)))
+        return {"ok": 0, "missing": []}
+
+    # Includes index history for the benchmark comparison.
+    closes = download_closes(
+        syms + list(BENCHMARKS.values())
+    )
+
+    quotes = {}
+    missing = []
+
+    for sym in syms:
+        if closes is None or closes.empty or sym not in closes.columns:
+            missing.append(sym)
+            continue
+
+        # Reject NaN, infinity, zero and negative prices.
+        prices = pd.to_numeric(
+            closes[sym],
+            errors="coerce",
+        ).dropna()
+
+        prices = prices[
+            prices.map(
+                lambda value: (
+                    math.isfinite(float(value))
+                    and float(value) > 0
+                )
+            )
+        ].sort_index()
+
+        if prices.empty:
+            missing.append(sym)
+            continue
+
+        price_date = pd.Timestamp(prices.index[-1])
+
+        if pd.isna(price_date):
+            missing.append(sym)
+            continue
+
+        quotes[sym] = {
+            "price": Decimal(str(prices.iloc[-1])),
+            "price_date": price_date.date(),
+        }
+
+    valid = sorted(quotes)
+
+    # Metadata failure must not prevent a valid price from being saved.
+    def safe_fetch_info(sym):
+        try:
+            result = fetch_info(sym)
+
+            if not isinstance(result, dict):
+                return {}
+
+            # Only retain relevant, nonempty metadata.
+            metadata = {}
+
+            sector = result.get("sector")
+            if isinstance(sector, str) and sector.strip():
+                metadata["sector"] = sector.strip()
+
+            market_cap = result.get("market_cap")
+            if market_cap is not None:
+                market_cap = float(market_cap)
+
+                if math.isfinite(market_cap) and market_cap > 0:
+                    metadata["market_cap"] = market_cap
+
+            return metadata
+
+        except Exception as exc:
+            log.warning(
+                "Metadata refresh failed for %s: %s",
+                sym,
+                type(exc).__name__,
+            )
+            return {}
+
+    infos = {}
+
+    if valid:
+        with ThreadPoolExecutor(
+            max_workers=min(4, len(valid))
+        ) as executor:
+            infos = dict(
+                zip(
+                    valid,
+                    executor.map(safe_fetch_info, valid),
+                )
+            )
+
+    # db() commits on success and rolls back on any exception.
     with db() as conn:
         for sym in valid:
-            col = closes[sym].dropna()
-            conn.execute("""INSERT INTO price_cache(symbol,price,price_date,retrieved_at,source,status,diagnostics)
-                VALUES (%s,%s,%s,now(),'yfinance','ok',%s::jsonb)
-                ON CONFLICT(symbol) DO UPDATE SET price=EXCLUDED.price,price_date=EXCLUDED.price_date,
-                retrieved_at=now(),source='yfinance',status='ok',
-                diagnostics=COALESCE(price_cache.diagnostics,'{}'::jsonb) || EXCLUDED.diagnostics""",
-                (sym, Decimal(str(float(col.iloc[-1]))), col.index[-1].date(), json.dumps(infos.get(sym, {}))))
-        missing = [s for s in syms if s not in valid]
-        conn.execute("INSERT INTO sw_audit_log(actor,action,entity,details) VALUES(%s,'prices.refresh','price_cache',%s::jsonb)",
-                     (st.session_state.get("sw_user", "admin"), json.dumps(dict(requested=len(syms), refreshed=len(valid), missing=missing))))
-    if not closes.empty:
+            quote = quotes[sym]
+
+            conn.execute(
+                """
+                INSERT INTO price_cache (
+                    symbol,
+                    price,
+                    price_date,
+                    retrieved_at,
+                    source,
+                    status,
+                    diagnostics
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    %s,
+                    now(),
+                    'yfinance',
+                    'ok',
+                    %s::jsonb
+                )
+                ON CONFLICT (symbol)
+                DO UPDATE SET
+                    price = EXCLUDED.price,
+                    price_date = EXCLUDED.price_date,
+                    retrieved_at = now(),
+                    source = 'yfinance',
+                    status = 'ok',
+                    diagnostics = (
+                        COALESCE(
+                            price_cache.diagnostics,
+                            '{}'::jsonb
+                        )
+                        || EXCLUDED.diagnostics
+                    )
+                """,
+                (
+                    sym,
+                    quote["price"],
+                    quote["price_date"],
+                    json.dumps(
+                        infos.get(sym, {}),
+                        allow_nan=False,
+                    ),
+                ),
+            )
+
+        # Your existing audit table uses these column names.
+        conn.execute(
+            """
+            INSERT INTO audit_logs (
+                action,
+                entity_type,
+                entity_id,
+                details
+            )
+            VALUES (
+                %s,
+                %s,
+                %s,
+                %s::jsonb
+            )
+            """,
+            (
+                "prices.refresh",
+                "price_cache",
+                None,
+                json.dumps(
+                    {
+                        "actor": st.session_state.get(
+                            "sw_user",
+                            "admin",
+                        ),
+                        "requested": len(syms),
+                        "refreshed": len(valid),
+                        "missing": missing,
+                    },
+                    allow_nan=False,
+                ),
+            ),
+        )
+
+    # Do not erase existing session history after an empty response.
+    if closes is not None and not closes.empty:
         st.session_state["closes"] = closes
-    return dict(ok=len(valid), missing=missing)
+
+    return {
+        "ok": len(valid),
+        "missing": missing,
+    }
 
 
 def refresh_ui():
