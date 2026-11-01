@@ -1,7 +1,6 @@
-streamlit
-psycopg[binary]
-bcrypt
-pandas
-plotly
-yfinance
-openpyxl
+streamlit>=1.40,<2.0
+psycopg[binary]>=3.2,<4.0
+bcrypt>=4.2,<6.0
+pandas>=2.2,<3.0
+plotly>=5.24,<7.0
+yfinance>=0.2.50,<2.0
