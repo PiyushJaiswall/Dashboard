@@ -1,44 +1,109 @@
-# app.py
-from __future__ import annotations
-
 import io
-import json
 import uuid
-from datetime import date, datetime, timedelta
-from decimal import Decimal, InvalidOperation
-from typing import Any
+from datetime import datetime, timezone
 
 import bcrypt
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import psycopg
 import streamlit as st
 import yfinance as yf
+
 from psycopg.rows import dict_row
 
 
-# ============================================================
-# 1. APPLICATION CONFIGURATION
-# ============================================================
+# =========================================================
+# CONFIGURATION
+# =========================================================
 
 st.set_page_config(
     page_title="Wealth Desk",
-    page_icon="📊",
+    page_icon="◈",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
-APP_NAME = "Wealth Desk"
-CURRENCY = "₹"
-STALE_PRICE_DAYS = 7
+GREEN = "#16A34A"
+RED = "#DC2626"
+NAVY = "#14213D"
+BLUE = "#2563EB"
+MUTED = "#64748B"
+
+st.markdown(
+    """
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap');
+
+    html, body, [class*="css"] {
+        font-family: 'DM Sans', sans-serif;
+    }
+
+    .stApp {
+        background: #F5F7FB;
+    }
+
+    .block-container {
+        max-width: 1500px;
+        padding-top: 1.5rem;
+        padding-bottom: 3rem;
+    }
+
+    h1, h2, h3 {
+        color: #14213D;
+    }
+
+    div[data-testid="stMetric"] {
+        background: white;
+        border: 1px solid #E5EAF2;
+        border-radius: 14px;
+        padding: 18px;
+        box-shadow: 0 3px 12px rgba(20, 33, 61, 0.035);
+    }
+
+    div[data-testid="stMetricLabel"] {
+        color: #64748B;
+        font-size: 0.88rem;
+    }
+
+    div[data-testid="stMetricValue"] {
+        color: #14213D;
+        font-weight: 700;
+    }
+
+    div.stButton > button {
+        border-radius: 9px;
+        font-weight: 600;
+    }
+
+    section[data-testid="stSidebar"] {
+        background: #FFFFFF;
+    }
+
+    .small-note {
+        color: #64748B;
+        font-size: 0.82rem;
+    }
+
+    .status-pill {
+        background: #E8F7EE;
+        color: #15803D;
+        padding: 5px 10px;
+        border-radius: 20px;
+        font-size: 0.82rem;
+        font-weight: 600;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
-# ============================================================
-# 2. DATABASE
-# ============================================================
+# =========================================================
+# DATABASE
+# =========================================================
 
 def get_connection():
-    """Create a PostgreSQL connection using Streamlit secrets."""
     return psycopg.connect(
         st.secrets["DATABASE_URL"],
         connect_timeout=10,
@@ -46,1268 +111,1244 @@ def get_connection():
     )
 
 
-def init_database():
-    """Create the application's tables if they do not exist."""
-    statements = [
-        """
-        CREATE TABLE IF NOT EXISTS clients (
-            id BIGSERIAL PRIMARY KEY,
-            name VARCHAR(150) NOT NULL,
-            email VARCHAR(254),
-            phone VARCHAR(40),
-            notes TEXT,
-            is_archived BOOLEAN NOT NULL DEFAULT FALSE,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS transactions (
-            id BIGSERIAL PRIMARY KEY,
-            client_id BIGINT NOT NULL REFERENCES clients(id),
-            ticker VARCHAR(40) NOT NULL,
-            transaction_type VARCHAR(4) NOT NULL
-                CHECK (transaction_type IN ('BUY', 'SELL')),
-            quantity NUMERIC(24, 8) NOT NULL CHECK (quantity > 0),
-            price NUMERIC(24, 8) NOT NULL CHECK (price > 0),
-            trade_date DATE NOT NULL,
-            notes TEXT,
-            request_id UUID NOT NULL UNIQUE,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-        """,
-        """
-        CREATE INDEX IF NOT EXISTS idx_transactions_client
-        ON transactions(client_id, trade_date, id)
-        """,
-        """
-        CREATE INDEX IF NOT EXISTS idx_transactions_ticker
-        ON transactions(ticker)
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS audit_logs (
-            id BIGSERIAL PRIMARY KEY,
-            action VARCHAR(60) NOT NULL,
-            entity_type VARCHAR(60) NOT NULL,
-            entity_id BIGINT,
-            details JSONB NOT NULL DEFAULT '{}'::jsonb,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-        """,
-    ]
-
+def initialize_database():
+    """
+    Reuses the existing clients table.
+    Creates separate holdings, cached prices, and audit tables.
+    Does not modify or delete the existing transactions table.
+    """
     with get_connection() as conn:
         with conn.cursor() as cur:
-            for statement in statements:
-                cur.execute(statement)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS wealth_holdings (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    client_id UUID NOT NULL REFERENCES clients(id),
+                    ticker TEXT NOT NULL,
+                    quantity NUMERIC(20, 6) NOT NULL
+                        CHECK (quantity > 0),
+                    average_cost NUMERIC(20, 6) NOT NULL
+                        CHECK (average_cost >= 0),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE (client_id, ticker)
+                );
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS wealth_price_cache (
+                    ticker TEXT PRIMARY KEY,
+                    price NUMERIC(20, 6) NOT NULL,
+                    price_date TEXT,
+                    fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    source TEXT NOT NULL DEFAULT 'Yahoo Finance'
+                );
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS wealth_audit_logs (
+                    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                    action TEXT NOT NULL,
+                    entity_type TEXT NOT NULL,
+                    entity_id TEXT,
+                    details JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_wealth_holdings_client
+                ON wealth_holdings(client_id);
+            """)
 
 
-def db_fetch(sql: str, params: tuple = ()) -> list[dict]:
-    """Run a query and return its rows as dictionaries."""
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            return cur.fetchall()
-
-
-def db_execute(sql: str, params: tuple = ()):
-    """Run a database write and commit it."""
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-
-
-def audit(action: str, entity_type: str, entity_id: int | None, details: dict):
-    """Record an administrative action without logging credentials."""
-    db_execute(
-        """
-        INSERT INTO audit_logs (action, entity_type, entity_id, details)
-        VALUES (%s, %s, %s, %s::jsonb)
-        """,
-        (action, entity_type, entity_id, json.dumps(details, default=str)),
-    )
-
-
-# ============================================================
-# 3. ADMIN AUTHENTICATION
-# ============================================================
-
-def login_screen():
-    st.title("🔐 Wealth Desk")
-    st.caption("Private portfolio management")
-
-    with st.form("login_form"):
-        username = st.text_input("Administrator username")
-        password = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Sign in", use_container_width=True)
-
-    if submitted:
-        try:
-            correct_username = st.secrets["ADMIN_USERNAME"]
-            password_hash = st.secrets["ADMIN_PASSWORD_HASH"]
-
-            username_ok = username == correct_username
-            password_ok = bcrypt.checkpw(
-                password.encode("utf-8"),
-                password_hash.encode("utf-8"),
-            )
-
-            if username_ok and password_ok:
-                st.session_state["authenticated"] = True
-                st.rerun()
-            else:
-                st.error("Incorrect username or password.")
-        except Exception:
-            st.error(
-                "Authentication is not configured correctly. "
-                "Check the application secrets."
-            )
-
-
-# ============================================================
-# 4. CLIENT MANAGEMENT
-# ============================================================
-
-def get_clients(include_archived: bool = False) -> pd.DataFrame:
-    if include_archived:
-        rows = db_fetch("SELECT * FROM clients ORDER BY name")
-    else:
-        rows = db_fetch(
-            "SELECT * FROM clients WHERE is_archived = FALSE ORDER BY name"
-        )
-    return pd.DataFrame(rows)
-
-
-def create_client(
-    name: str,
-    email: str,
-    phone: str,
-    notes: str,
-):
-    name = name.strip()
-    if not name:
-        raise ValueError("Client name is required.")
+def audit(action, entity_type, entity_id=None, details=None):
+    import json
 
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO clients (name, email, phone, notes)
-                VALUES (%s, %s, %s, %s)
-                RETURNING id
-                """,
-                (name, email.strip() or None, phone.strip() or None,
-                 notes.strip() or None),
-            )
-            client_id = cur.fetchone()["id"]
-
-    audit("CREATE", "client", client_id, {"name": name})
-
-
-def update_client(
-    client_id: int,
-    name: str,
-    email: str,
-    phone: str,
-    notes: str,
-):
-    name = name.strip()
-    if not name:
-        raise ValueError("Client name is required.")
-
-    db_execute(
-        """
-        UPDATE clients
-        SET name = %s, email = %s, phone = %s, notes = %s,
-            updated_at = NOW()
-        WHERE id = %s
-        """,
-        (
-            name,
-            email.strip() or None,
-            phone.strip() or None,
-            notes.strip() or None,
-            client_id,
-        ),
-    )
-    audit("UPDATE", "client", client_id, {"name": name})
-
-
-def set_client_archived(client_id: int, archived: bool):
-    db_execute(
-        """
-        UPDATE clients
-        SET is_archived = %s, updated_at = NOW()
-        WHERE id = %s
-        """,
-        (archived, client_id),
-    )
-    audit(
-        "ARCHIVE" if archived else "UNARCHIVE",
-        "client",
-        client_id,
-        {"is_archived": archived},
-    )
-
-
-# ============================================================
-# 5. TRANSACTION LEDGER
-# ============================================================
-
-def get_transactions(client_id: int | None = None) -> pd.DataFrame:
-    if client_id is None:
-        rows = db_fetch(
-            """
-            SELECT t.*, c.name AS client_name
-            FROM transactions t
-            JOIN clients c ON c.id = t.client_id
-            ORDER BY t.trade_date, t.id
-            """
-        )
-    else:
-        rows = db_fetch(
-            """
-            SELECT t.*, c.name AS client_name
-            FROM transactions t
-            JOIN clients c ON c.id = t.client_id
-            WHERE t.client_id = %s
-            ORDER BY t.trade_date, t.id
-            """,
-            (client_id,),
-        )
-
-    return pd.DataFrame(rows)
-
-
-def decimal_value(value: Any) -> Decimal:
-    try:
-        result = Decimal(str(value))
-    except (InvalidOperation, TypeError, ValueError):
-        raise ValueError("Quantity and price must be valid numbers.")
-
-    if not result.is_finite():
-        raise ValueError("Quantity and price must be finite numbers.")
-
-    return result
-
-
-def calculate_fifo(transactions: pd.DataFrame) -> dict:
-    """
-    Calculate open lots and realized P&L using FIFO.
-
-    Each purchase creates a lot. Each sale consumes the oldest
-    available lot first. Fees, taxes, dividends, and corporate
-    actions are intentionally excluded in this version.
-    """
-    lots_by_key: dict[tuple[int, str], list[dict]] = {}
-    realized_by_key: dict[tuple[int, str], Decimal] = {}
-    realized_events = []
-
-    if transactions.empty:
-        return {
-            "lots": lots_by_key,
-            "realized": realized_by_key,
-            "realized_events": realized_events,
-        }
-
-    tx = transactions.copy()
-    tx["trade_date"] = pd.to_datetime(tx["trade_date"]).dt.date
-    tx = tx.sort_values(["trade_date", "id"])
-
-    for row in tx.to_dict("records"):
-        client_id = int(row["client_id"])
-        ticker = str(row["ticker"]).strip().upper()
-        tx_type = str(row["transaction_type"]).upper()
-        quantity = decimal_value(row["quantity"])
-        price = decimal_value(row["price"])
-        key = (client_id, ticker)
-
-        lots = lots_by_key.setdefault(key, [])
-        realized_by_key.setdefault(key, Decimal("0"))
-
-        if quantity <= 0 or price <= 0:
-            raise ValueError(f"Invalid transaction #{row['id']}.")
-
-        if tx_type == "BUY":
-            lots.append({
-                "quantity": quantity,
-                "unit_cost": price,
-                "buy_date": row["trade_date"],
-                "buy_transaction_id": int(row["id"]),
-            })
-
-        elif tx_type == "SELL":
-            remaining_to_sell = quantity
-            sale_realized = Decimal("0")
-
-            while remaining_to_sell > 0:
-                # Remove lots that have been completely consumed.
-                while lots and lots[0]["quantity"] <= 0:
-                    lots.pop(0)
-
-                if not lots:
-                    raise ValueError(
-                        f"Transaction #{row['id']} sells more "
-                        f"{ticker} than the available FIFO quantity. "
-                        "Check the transaction history and dates."
-                    )
-
-                lot = lots[0]
-                matched = min(remaining_to_sell, lot["quantity"])
-
-                sale_realized += matched * (price - lot["unit_cost"])
-                lot["quantity"] -= matched
-                remaining_to_sell -= matched
-
-            realized_by_key[key] += sale_realized
-            realized_events.append({
-                "transaction_id": int(row["id"]),
-                "client_id": client_id,
-                "ticker": ticker,
-                "trade_date": row["trade_date"],
-                "quantity_sold": float(quantity),
-                "sale_price": float(price),
-                "realized_pnl": float(sale_realized),
-            })
-
-        else:
-            raise ValueError(
-                f"Unsupported transaction type: {tx_type}"
-            )
-
-    return {
-        "lots": lots_by_key,
-        "realized": realized_by_key,
-        "realized_events": realized_events,
-    }
-
-
-def add_transaction(
-    client_id: int,
-    ticker: str,
-    transaction_type: str,
-    quantity: Decimal,
-    price: Decimal,
-    trade_date: date,
-    notes: str,
-):
-    ticker = ticker.strip().upper()
-
-    if not ticker:
-        raise ValueError("A Yahoo Finance ticker is required.")
-    if len(ticker) > 40:
-        raise ValueError("Ticker is too long.")
-    if quantity <= 0 or price <= 0:
-        raise ValueError("Quantity and price must be greater than zero.")
-    if trade_date > date.today():
-        raise ValueError("Future-dated transactions are not supported.")
-
-    transaction_type = transaction_type.upper()
-    if transaction_type not in {"BUY", "SELL"}:
-        raise ValueError("Transaction type must be BUY or SELL.")
-
-    # Validate the entire resulting ledger before writing anything.
-    existing = get_transactions(client_id)
-    candidate_id = (
-        int(existing["id"].max()) + 1 if not existing.empty else 1
-    )
-
-    candidate = pd.DataFrame([{
-        "id": candidate_id,
-        "client_id": client_id,
-        "ticker": ticker,
-        "transaction_type": transaction_type,
-        "quantity": quantity,
-        "price": price,
-        "trade_date": trade_date,
-    }])
-
-    if not existing.empty:
-        validation_df = existing[
-            [
-                "id", "client_id", "ticker", "transaction_type",
-                "quantity", "price", "trade_date",
-            ]
-        ].copy()
-        validation_df = pd.concat(
-            [validation_df, candidate], ignore_index=True
-        )
-    else:
-        validation_df = candidate
-
-    calculate_fifo(validation_df)
-
-    request_id = str(uuid.uuid4())
-
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO transactions
-                    (client_id, ticker, transaction_type,
-                     quantity, price, trade_date, notes, request_id)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING id
+                INSERT INTO wealth_audit_logs
+                    (action, entity_type, entity_id, details)
+                VALUES (%s, %s, %s, %s::jsonb)
                 """,
                 (
-                    client_id,
-                    ticker,
-                    transaction_type,
-                    quantity,
-                    price,
-                    trade_date,
-                    notes.strip() or None,
-                    request_id,
+                    action,
+                    entity_type,
+                    str(entity_id) if entity_id else None,
+                    json.dumps(details or {}),
                 ),
             )
-            transaction_id = cur.fetchone()["id"]
-
-    audit(
-        "CREATE",
-        "transaction",
-        transaction_id,
-        {
-            "client_id": client_id,
-            "ticker": ticker,
-            "type": transaction_type,
-            "quantity": str(quantity),
-            "price": str(price),
-            "trade_date": str(trade_date),
-        },
-    )
 
 
-def delete_transaction(transaction_id: int):
-    rows = db_fetch(
-        """
-        SELECT id, client_id, ticker, transaction_type,
-               quantity, price, trade_date
-        FROM transactions WHERE id = %s
-        """,
-        (transaction_id,),
-    )
+def read_clients():
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, name, email, phone, notes, is_archived
+                FROM clients
+                ORDER BY name;
+            """)
+            rows = cur.fetchall()
 
-    if not rows:
-        raise ValueError("Transaction not found.")
-
-    old = rows[0]
-
-    # Keep a record of the deletion before removing the transaction.
-    audit(
-        "DELETE",
-        "transaction",
-        transaction_id,
-        {key: str(value) for key, value in old.items()},
-    )
-
-    db_execute("DELETE FROM transactions WHERE id = %s", (transaction_id,))
-
-    # A deletion can affect the FIFO validity of later transactions.
-    remaining = get_transactions(int(old["client_id"]))
-    calculate_fifo(remaining)
+    return pd.DataFrame(rows)
 
 
-# ============================================================
-# 6. MARKET DATA — IN-MEMORY CACHE ONLY
-# ============================================================
+def read_holdings():
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    h.id,
+                    h.client_id,
+                    c.name AS client_name,
+                    h.ticker,
+                    h.quantity,
+                    h.average_cost,
+                    h.updated_at
+                FROM wealth_holdings h
+                JOIN clients c ON c.id = h.client_id
+                WHERE COALESCE(c.is_archived, FALSE) = FALSE
+                ORDER BY c.name, h.ticker;
+            """)
+            rows = cur.fetchall()
 
-@st.cache_data(ttl=300, show_spinner=False, max_entries=500)
-def get_latest_close(ticker: str) -> dict:
+    return pd.DataFrame(rows)
+
+
+def read_prices():
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT ticker, price, price_date, fetched_at, source
+                FROM wealth_price_cache;
+            """)
+            rows = cur.fetchall()
+
+    return pd.DataFrame(rows)
+
+
+# =========================================================
+# PRICE REFRESH
+# =========================================================
+
+def normalize_ticker(ticker):
+    ticker = ticker.strip().upper()
+
+    # Default Indian exchange suffix when user enters a bare symbol.
+    if "." not in ticker:
+        ticker += ".NS"
+
+    return ticker
+
+
+def refresh_market_prices(tickers):
     """
-    Fetch the latest available daily closing price.
-
-    Prices are cached in application memory for five minutes.
-    No market-price history is written to PostgreSQL.
+    Fetches prices only when the user explicitly refreshes.
+    Stores only the latest successful price per ticker.
     """
-    try:
-        history = yf.Ticker(ticker).history(
-            period="1mo",
-            interval="1d",
-            auto_adjust=False,
-            actions=False,
-        )
+    results = []
+    failures = []
 
-        if history.empty or "Close" not in history.columns:
-            return {
-                "price": None,
-                "price_date": None,
-                "status": "MISSING",
-                "message": "No daily price data returned.",
-            }
-
-        history = history.dropna(subset=["Close"])
-        if history.empty:
-            return {
-                "price": None,
-                "price_date": None,
-                "status": "MISSING",
-                "message": "No valid closing price returned.",
-            }
-
-        last_index = pd.Timestamp(history.index[-1])
-        price_date = last_index.date()
-        price = float(history["Close"].iloc[-1])
-
-        if price <= 0:
-            return {
-                "price": None,
-                "price_date": price_date.isoformat(),
-                "status": "MISSING",
-                "message": "Returned price is not valid.",
-            }
-
-        if (date.today() - price_date).days > STALE_PRICE_DAYS:
-            return {
-                "price": price,
-                "price_date": price_date.isoformat(),
-                "status": "STALE",
-                "message": "Last available close is older than expected.",
-            }
-
-        return {
-            "price": price,
-            "price_date": price_date.isoformat(),
-            "status": "OK",
-            "message": "Latest available daily close.",
-        }
-
-    except Exception as exc:
-        # Avoid exposing technical details or credentials in the UI.
-        return {
-            "price": None,
-            "price_date": None,
-            "status": "MISSING",
-            "message": f"Price retrieval failed ({type(exc).__name__}).",
-        }
-
-
-# ============================================================
-# 7. PORTFOLIO VALUATION
-# ============================================================
-
-def build_holdings(client_id: int | None = None) -> pd.DataFrame:
-    transactions = get_transactions(client_id)
-
-    columns = [
-        "client_id", "client_name", "ticker", "quantity",
-        "cost_basis", "average_cost", "realized_pnl",
-        "market_price", "market_value", "unrealized_pnl",
-        "total_pnl", "price_date", "price_status", "price_message",
-    ]
-
-    if transactions.empty:
-        return pd.DataFrame(columns=columns)
-
-    fifo = calculate_fifo(transactions)
-    client_names = {
-        int(row["id"]): row["name"]
-        for row in db_fetch("SELECT id, name FROM clients")
-    }
-
-    rows = []
-
-    for (cid, ticker), lots in fifo["lots"].items():
-        open_lots = [lot for lot in lots if lot["quantity"] > 0]
-        quantity = sum(
-            (lot["quantity"] for lot in open_lots), Decimal("0")
-        )
-
-        if quantity <= 0:
-            continue
-
-        cost_basis = sum(
-            (
-                lot["quantity"] * lot["unit_cost"]
-                for lot in open_lots
-            ),
-            Decimal("0"),
-        )
-        average_cost = cost_basis / quantity
-        realized_pnl = fifo["realized"].get((cid, ticker), Decimal("0"))
-
-        price_data = get_latest_close(ticker)
-
-        # Do not include missing or stale prices in market-value totals.
-        usable_price = (
-            price_data["price"]
-            if price_data["status"] == "OK"
-            else None
-        )
-
-        market_value = (
-            quantity * Decimal(str(usable_price))
-            if usable_price is not None
-            else None
-        )
-
-        unrealized_pnl = (
-            market_value - cost_basis
-            if market_value is not None
-            else None
-        )
-
-        total_pnl = (
-            realized_pnl + unrealized_pnl
-            if unrealized_pnl is not None
-            else None
-        )
-
-        rows.append({
-            "client_id": cid,
-            "client_name": client_names.get(cid, f"Client {cid}"),
-            "ticker": ticker,
-            "quantity": float(quantity),
-            "cost_basis": float(cost_basis),
-            "average_cost": float(average_cost),
-            "realized_pnl": float(realized_pnl),
-            "market_price": usable_price,
-            "market_value": (
-                float(market_value) if market_value is not None else None
-            ),
-            "unrealized_pnl": (
-                float(unrealized_pnl)
-                if unrealized_pnl is not None else None
-            ),
-            "total_pnl": (
-                float(total_pnl) if total_pnl is not None else None
-            ),
-            "price_date": price_data["price_date"],
-            "price_status": price_data["status"],
-            "price_message": price_data["message"],
-        })
-
-    return pd.DataFrame(rows, columns=columns)
-
-
-def money(value: float | int | None) -> str:
-    if value is None or pd.isna(value):
-        return "—"
-    return f"{CURRENCY}{value:,.2f}"
-
-
-def render_metrics(holdings: pd.DataFrame):
-    if holdings.empty:
-        st.info("No open holdings yet. Add a purchase to get started.")
-        return
-
-    total_cost = holdings["cost_basis"].sum()
-    valid_prices = holdings["price_status"].eq("OK")
-    priced = holdings[valid_prices]
-
-    market_value = priced["market_value"].sum()
-    unrealized = priced["unrealized_pnl"].sum()
-    realized = holdings["realized_pnl"].sum()
-    missing_count = int((~valid_prices).sum())
-
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Remaining cost basis", money(total_cost))
-    col2.metric(
-        "Market value",
-        money(market_value),
-        help="Only holdings with usable, non-stale prices are included.",
-    )
-    col3.metric("Realized P&L", money(realized))
-    col4.metric(
-        "Unrealized P&L",
-        money(unrealized),
-        help="Only holdings with usable, non-stale prices are included.",
-    )
-
-    if missing_count:
-        st.warning(
-            f"{missing_count} holding(s) have missing or stale prices. "
-            "Market value and unrealized P&L are partial; those holdings "
-            "are excluded from these totals."
-        )
-
-
-def render_holdings_table(holdings: pd.DataFrame):
-    if holdings.empty:
-        st.info("There are no open holdings to display.")
-        return
-
-    display = holdings.copy()
-    display = display.rename(columns={
-        "client_name": "Client",
-        "ticker": "Ticker",
-        "quantity": "Quantity",
-        "average_cost": "Average cost",
-        "cost_basis": "Remaining cost basis",
-        "market_price": "Latest close",
-        "market_value": "Market value",
-        "realized_pnl": "Realized P&L",
-        "unrealized_pnl": "Unrealized P&L",
-        "total_pnl": "Total P&L",
-        "price_date": "Price date",
-        "price_status": "Price status",
+    unique_tickers = sorted({
+        normalize_ticker(t)
+        for t in tickers
+        if str(t).strip()
     })
 
-    wanted = [
-        "Client", "Ticker", "Quantity", "Average cost",
-        "Remaining cost basis", "Latest close", "Market value",
-        "Realized P&L", "Unrealized P&L", "Total P&L",
-        "Price date", "Price status",
-    ]
-    st.dataframe(
-        display[wanted],
-        use_container_width=True,
-        hide_index=True,
-    )
+    progress = st.progress(0, text="Refreshing market prices...")
 
+    for index, ticker in enumerate(unique_tickers, start=1):
+        try:
+            hist = yf.Ticker(ticker).history(
+                period="5d",
+                interval="1d",
+                auto_adjust=False,
+            )
 
-# ============================================================
-# 8. DASHBOARDS AND CHARTS
-# ============================================================
+            if hist.empty or "Close" not in hist:
+                failures.append(ticker)
+            else:
+                closes = hist["Close"].dropna()
 
-def render_portfolio_dashboard(
-    holdings: pd.DataFrame,
-    transactions: pd.DataFrame,
-    title: str,
-):
-    st.title(title)
-    st.caption(
-        "INR reporting • FIFO cost basis • Latest available daily close"
-    )
+                if closes.empty:
+                    failures.append(ticker)
+                else:
+                    price = float(closes.iloc[-1])
+                    price_date = str(closes.index[-1].date())
 
-    render_metrics(holdings)
+                    if price <= 0:
+                        failures.append(ticker)
+                    else:
+                        results.append(
+                            (ticker, price, price_date)
+                        )
 
-    if not holdings.empty:
-        st.subheader("Open holdings")
-        render_holdings_table(holdings)
+        except Exception:
+            failures.append(ticker)
 
-        priced = holdings[
-            holdings["price_status"].eq("OK")
-            & holdings["market_value"].notna()
-        ]
-
-        if not priced.empty:
-            left, right = st.columns(2)
-
-            with left:
-                st.subheader("Allocation by ticker")
-                allocation = (
-                    priced.groupby("ticker", as_index=False)["market_value"]
-                    .sum()
-                )
-                fig = px.pie(
-                    allocation,
-                    names="ticker",
-                    values="market_value",
-                    hole=0.45,
-                )
-                st.plotly_chart(fig, use_container_width=True)
-
-            with right:
-                st.subheader("Cost basis vs. market value")
-                chart_df = priced.melt(
-                    id_vars=["ticker"],
-                    value_vars=["cost_basis", "market_value"],
-                    var_name="Measure",
-                    value_name="Amount",
-                )
-                fig = px.bar(
-                    chart_df,
-                    x="ticker",
-                    y="Amount",
-                    color="Measure",
-                    barmode="group",
-                )
-                st.plotly_chart(fig, use_container_width=True)
-
-    if not transactions.empty:
-        st.subheader("Recent transactions")
-        recent = transactions.sort_values(
-            ["trade_date", "id"], ascending=False
-        ).head(15).copy()
-
-        for col in ["quantity", "price"]:
-            recent[col] = pd.to_numeric(recent[col], errors="coerce")
-
-        st.dataframe(
-            recent[
-                [
-                    "trade_date", "ticker", "transaction_type",
-                    "quantity", "price", "notes",
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True,
+        progress.progress(
+            index / max(len(unique_tickers), 1),
+            text=f"Refreshing {ticker}...",
         )
 
+    progress.empty()
 
-# ============================================================
-# 9. EXPORTS
-# ============================================================
+    if results:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                for ticker, price, price_date in results:
+                    cur.execute(
+                        """
+                        INSERT INTO wealth_price_cache
+                            (ticker, price, price_date, fetched_at, source)
+                        VALUES (%s, %s, %s, NOW(), 'Yahoo Finance')
+                        ON CONFLICT (ticker)
+                        DO UPDATE SET
+                            price = EXCLUDED.price,
+                            price_date = EXCLUDED.price_date,
+                            fetched_at = NOW(),
+                            source = EXCLUDED.source;
+                        """,
+                        (ticker, price, price_date),
+                    )
 
-def csv_download(df: pd.DataFrame, filename: str, label: str):
-    payload = df.to_csv(index=False).encode("utf-8-sig")
-    st.download_button(
-        label,
-        data=payload,
-        file_name=filename,
-        mime="text/csv",
-        use_container_width=True,
-    )
-
-
-def excel_download(
-    holdings: pd.DataFrame,
-    transactions: pd.DataFrame,
-    filename: str,
-    label: str,
-):
-    output = io.BytesIO()
-
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        holdings.to_excel(
-            writer, sheet_name="Holdings", index=False
-        )
-        transactions.to_excel(
-            writer, sheet_name="Transactions", index=False
-        )
-
-    st.download_button(
-        label,
-        data=output.getvalue(),
-        file_name=filename,
-        mime=(
-            "application/vnd.openxmlformats-officedocument."
-            "spreadsheetml.sheet"
-        ),
-        use_container_width=True,
-    )
+    return len(results), failures
 
 
-# ============================================================
-# 10. STREAMLIT PAGES
-# ============================================================
+# =========================================================
+# PORTFOLIO CALCULATIONS
+# =========================================================
 
-def page_overview():
-    clients = get_clients()
-    holdings = build_holdings()
-    transactions = get_transactions()
+def prepare_portfolio(holdings, prices):
+    if holdings.empty:
+        return pd.DataFrame()
 
-    st.title("📊 Wealth Desk")
-    st.caption("Consolidated view of all active client portfolios")
+    df = holdings.copy()
 
-    if clients.empty:
-        st.info("Create your first client in Client Management.")
+    df["ticker"] = df["ticker"].astype(str).str.upper()
+    df["quantity"] = pd.to_numeric(df["quantity"])
+    df["average_cost"] = pd.to_numeric(df["average_cost"])
+
+    if prices.empty:
+        df["current_price"] = float("nan")
+        df["price_fetched_at"] = pd.NaT
+        df["price_date"] = None
     else:
-        st.metric("Active clients", len(clients))
+        prices = prices.copy()
+        prices["ticker"] = prices["ticker"].astype(str).str.upper()
+        prices["price"] = pd.to_numeric(prices["price"])
 
-    render_metrics(holdings)
-
-    if not holdings.empty:
-        st.subheader("Consolidated holdings")
-        render_holdings_table(holdings)
-
-        priced = holdings[
-            holdings["price_status"].eq("OK")
-            & holdings["market_value"].notna()
-        ]
-        if not priced.empty:
-            st.subheader("Portfolio value by client")
-            by_client = (
-                priced.groupby("client_name", as_index=False)["market_value"]
-                .sum()
-                .sort_values("market_value", ascending=False)
-            )
-            fig = px.bar(
-                by_client,
-                x="client_name",
-                y="market_value",
-                labels={
-                    "client_name": "Client",
-                    "market_value": "Market value (INR)",
-                },
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-    if not clients.empty:
-        st.subheader("Client directory")
-        st.dataframe(
-            clients[["id", "name", "email", "phone", "created_at"]],
-            use_container_width=True,
-            hide_index=True,
+        df = df.merge(
+            prices[["ticker", "price", "fetched_at", "price_date"]],
+            on="ticker",
+            how="left",
         )
 
-    with st.expander("Export consolidated reports"):
-        col1, col2 = st.columns(2)
-        with col1:
-            csv_download(
-                holdings,
-                "wealth_desk_consolidated_holdings.csv",
-                "Download holdings CSV",
-            )
-        with col2:
-            excel_download(
-                holdings,
-                transactions,
-                "wealth_desk_consolidated_report.xlsx",
-                "Download Excel report",
-            )
+        df = df.rename(
+            columns={
+                "price": "current_price",
+                "fetched_at": "price_fetched_at",
+            }
+        )
+
+    df["invested"] = df["quantity"] * df["average_cost"]
+
+    df["market_value"] = (
+        df["quantity"] * df["current_price"]
+    )
+
+    df["pnl"] = df["market_value"] - df["invested"]
+
+    df["return_pct"] = (
+        df["pnl"] / df["invested"].replace(0, float("nan")) * 100
+    )
+
+    df["price_available"] = df["current_price"].notna()
+
+    return df
 
 
-def page_clients():
-    st.title("👥 Client Management")
+def money(value):
+    if pd.isna(value):
+        return "—"
 
-    create_tab, edit_tab = st.tabs(["Add client", "Edit / archive client"])
+    return f"₹{value:,.2f}"
 
-    with create_tab:
-        with st.form("create_client_form", clear_on_submit=True):
-            name = st.text_input("Client name *")
-            email = st.text_input("Email")
-            phone = st.text_input("Phone")
-            notes = st.text_area("Notes")
-            submitted = st.form_submit_button(
-                "Create client", use_container_width=True
-            )
 
-        if submitted:
-            try:
-                create_client(name, email, phone, notes)
-                st.success("Client created.")
-                st.rerun()
-            except Exception as exc:
-                st.error(f"Could not create client: {exc}")
+def signed_money(value):
+    if pd.isna(value):
+        return "—"
 
-    with edit_tab:
-        all_clients = get_clients(include_archived=True)
+    sign = "+" if value > 0 else ""
+    return f"{sign}₹{value:,.2f}"
 
-        if all_clients.empty:
-            st.info("No clients have been created yet.")
-            return
 
-        options = {
-            f"{row['name']} (ID {row['id']})": row
-            for row in all_clients.to_dict("records")
+def signed_pct(value):
+    if pd.isna(value):
+        return "—"
+
+    return f"{value:+.2f}%"
+
+
+def metric(label, value, delta=None):
+    st.metric(label, value, delta=delta)
+
+
+def portfolio_totals(df):
+    if df.empty:
+        return {
+            "invested": 0.0,
+            "market_value": 0.0,
+            "pnl": 0.0,
+            "return_pct": 0.0,
+            "missing": 0,
         }
-        selected_label = st.selectbox(
-            "Select client",
-            list(options.keys()),
-        )
-        selected = options[selected_label]
 
-        with st.form("edit_client_form"):
-            name = st.text_input("Client name", value=selected["name"])
-            email = st.text_input(
-                "Email", value=selected.get("email") or ""
-            )
-            phone = st.text_input(
-                "Phone", value=selected.get("phone") or ""
-            )
-            notes = st.text_area(
-                "Notes", value=selected.get("notes") or ""
-            )
-            save = st.form_submit_button(
-                "Save changes", use_container_width=True
-            )
+    priced = df[df["price_available"]].copy()
 
-        if save:
-            try:
-                update_client(
-                    int(selected["id"]), name, email, phone, notes
-                )
-                st.success("Client updated.")
-                st.rerun()
-            except Exception as exc:
-                st.error(f"Could not update client: {exc}")
+    invested = float(priced["invested"].sum())
+    market_value = float(priced["market_value"].sum())
+    pnl = market_value - invested
+    ret = (pnl / invested * 100) if invested else 0.0
 
-        st.divider()
-        is_archived = bool(selected["is_archived"])
-
-        if not is_archived:
-            st.warning(
-                "Archiving hides this client from active client selectors. "
-                "It does not delete the client's transactions."
-            )
-            if st.button("Archive selected client"):
-                set_client_archived(int(selected["id"]), True)
-                st.success("Client archived.")
-                st.rerun()
-        else:
-            st.info("This client is archived.")
-            if st.button("Restore selected client"):
-                set_client_archived(int(selected["id"]), False)
-                st.success("Client restored.")
-                st.rerun()
-
-
-def page_transactions():
-    st.title("🧾 Transaction Management")
-
-    clients = get_clients()
-    if clients.empty:
-        st.warning("Create an active client before adding transactions.")
-        return
-
-    client_map = {
-        f"{row['name']} (ID {row['id']})": int(row["id"])
-        for row in clients.to_dict("records")
+    return {
+        "invested": invested,
+        "market_value": market_value,
+        "pnl": pnl,
+        "return_pct": ret,
+        "missing": int((~df["price_available"]).sum()),
     }
 
-    with st.form("add_transaction_form", clear_on_submit=True):
-        client_label = st.selectbox("Client", list(client_map.keys()))
-        ticker = st.text_input(
-            "Yahoo Finance ticker *",
-            placeholder="RELIANCE.NS",
-            help="Use .NS for NSE or .BO for BSE when supported.",
-        )
-        transaction_type = st.selectbox(
-            "Transaction type", ["BUY", "SELL"]
-        )
-        col1, col2 = st.columns(2)
-        with col1:
-            quantity_input = st.text_input(
-                "Quantity *", placeholder="10 or 0.5"
-            )
-        with col2:
-            price_input = st.text_input(
-                "Price per share (INR) *", placeholder="1250.00"
-            )
 
-        trade_date = st.date_input(
-            "Trade date",
-            value=date.today(),
-            max_value=date.today(),
-        )
-        notes = st.text_input("Notes (optional)")
-        submitted = st.form_submit_button(
-            "Save transaction", use_container_width=True
-        )
+# =========================================================
+# LOGIN
+# =========================================================
 
-    if submitted:
-        try:
-            quantity = decimal_value(quantity_input)
-            price = decimal_value(price_input)
-
-            add_transaction(
-                client_id=client_map[client_label],
-                ticker=ticker,
-                transaction_type=transaction_type,
-                quantity=quantity,
-                price=price,
-                trade_date=trade_date,
-                notes=notes,
-            )
-            st.success("Transaction saved.")
-            st.rerun()
-        except Exception as exc:
-            st.error(f"Transaction was not saved: {exc}")
-
+def login_screen():
+    st.markdown("# ◈ Wealth Desk")
+    st.caption("Portfolio intelligence for every client")
     st.divider()
-    st.subheader("Transaction history")
 
-    selected_client_label = st.selectbox(
-        "Filter history by client",
-        ["All clients"] + list(client_map.keys()),
-        key="transaction_history_filter",
+    _, center, _ = st.columns([1, 1.1, 1])
+
+    with center:
+        st.subheader("Admin sign in")
+
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+
+        if st.button("Sign in", type="primary", use_container_width=True):
+            try:
+                expected_username = st.secrets["ADMIN_USERNAME"]
+                expected_hash = st.secrets["ADMIN_PASSWORD_HASH"].encode()
+
+                valid_password = bcrypt.checkpw(
+                    password.encode(),
+                    expected_hash,
+                )
+
+                if username == expected_username and valid_password:
+                    st.session_state["authenticated"] = True
+                    st.rerun()
+                else:
+                    st.error("Incorrect username or password.")
+
+            except Exception:
+                st.error(
+                    "Authentication settings are missing or invalid. "
+                    "Check your Streamlit Secrets."
+                )
+
+
+if not st.session_state.get("authenticated", False):
+    login_screen()
+    st.stop()
+
+
+# =========================================================
+# INITIALIZE AND LOAD DATA
+# =========================================================
+
+try:
+    initialize_database()
+
+    clients_df = read_clients()
+    holdings_df = read_holdings()
+    prices_df = read_prices()
+
+except Exception as exc:
+    st.error(
+        "Wealth Desk could not load its database. "
+        "Check DATABASE_URL and your Supabase connection."
+    )
+    st.caption(f"Error type: {type(exc).__name__}")
+    st.stop()
+
+
+# =========================================================
+# HEADER
+# =========================================================
+
+header_left, header_right = st.columns([3, 1])
+
+with header_left:
+    st.markdown("# ◈ Wealth Desk")
+    st.caption("A consolidated view of your clients' portfolios")
+
+with header_right:
+    if st.button("↻ Refresh Prices", type="primary", use_container_width=True):
+        if holdings_df.empty:
+            st.info("Add holdings before refreshing prices.")
+        else:
+            updated, failed = refresh_market_prices(
+                holdings_df["ticker"].dropna().tolist()
+            )
+
+            st.session_state["last_refresh_result"] = (
+                updated,
+                failed,
+            )
+            st.rerun()
+
+    if st.button("Sign out", use_container_width=True):
+        st.session_state["authenticated"] = False
+        st.rerun()
+
+st.divider()
+
+if clients_df.empty:
+    clients_df = pd.DataFrame(
+        columns=["id", "name", "email", "phone", "notes", "is_archived"]
     )
 
-    selected_client_id = (
-        None if selected_client_label == "All clients"
-        else client_map[selected_client_label]
-    )
-    history = get_transactions(selected_client_id)
-
-    if history.empty:
-        st.info("No transactions found.")
-        return
-
-    st.dataframe(
-        history[
-            [
-                "id", "client_name", "trade_date", "ticker",
-                "transaction_type", "quantity", "price", "notes",
-            ]
-        ],
-        use_container_width=True,
-        hide_index=True,
+if not clients_df.empty:
+    clients_df["is_archived"] = (
+        clients_df["is_archived"].fillna(False).astype(bool)
     )
 
-    with st.expander("Correct an incorrect transaction"):
+active_clients = clients_df[
+    ~clients_df["is_archived"]
+].copy()
+
+portfolio_df = prepare_portfolio(holdings_df, prices_df)
+
+# Show the last successful price refresh, if available.
+if not prices_df.empty:
+    latest_refresh = pd.to_datetime(
+        prices_df["fetched_at"], utc=True, errors="coerce"
+    ).max()
+
+    if pd.notna(latest_refresh):
+        st.caption(
+            "Cached market prices · Last successful update: "
+            + latest_refresh.strftime("%d %b %Y, %H:%M UTC")
+        )
+else:
+    st.warning(
+        "No cached market prices yet. Add holdings and click "
+        "'Refresh Prices' to fetch market data."
+    )
+
+if "last_refresh_result" in st.session_state:
+    updated, failed = st.session_state["last_refresh_result"]
+
+    if failed:
         st.warning(
-            "Deleting a transaction changes FIFO cost basis and P&L. "
-            "Export a report first if you need a record of the original."
+            f"Updated {updated} ticker(s). "
+            f"Prices unavailable for: {', '.join(failed)}"
+        )
+    else:
+        st.success(f"Successfully updated {updated} ticker(s).")
+
+
+# =========================================================
+# CLIENT SELECTOR
+# =========================================================
+
+client_options = ["All Clients"] + active_clients["name"].tolist()
+
+selected_client_name = st.selectbox(
+    "View portfolio",
+    client_options,
+    key="selected_client",
+)
+
+if selected_client_name == "All Clients":
+    selected_df = portfolio_df.copy()
+else:
+    selected_df = portfolio_df[
+        portfolio_df["client_name"] == selected_client_name
+    ].copy()
+
+totals = portfolio_totals(selected_df)
+
+
+# =========================================================
+# KPI CARDS
+# =========================================================
+
+st.markdown("## Portfolio overview")
+
+k1, k2, k3, k4, k5 = st.columns(5)
+
+with k1:
+    metric(
+        "Current Value",
+        money(totals["market_value"]),
+    )
+
+with k2:
+    metric(
+        "Invested Capital",
+        money(totals["invested"]),
+    )
+
+with k3:
+    metric(
+        "Unrealized P&L",
+        signed_money(totals["pnl"]),
+        signed_pct(totals["return_pct"]),
+    )
+
+with k4:
+    metric(
+        "Return",
+        signed_pct(totals["return_pct"]),
+    )
+
+with k5:
+    if selected_client_name == "All Clients":
+        metric("Active Clients", str(len(active_clients)))
+    else:
+        metric("Stock Holdings", str(len(selected_df)))
+
+
+if totals["missing"] > 0:
+    st.warning(
+        f"{totals['missing']} holding(s) have no cached market price. "
+        "Their values are excluded from current-value and P&L totals."
+    )
+
+
+# =========================================================
+# CHARTS
+# =========================================================
+
+st.markdown("## Portfolio analytics")
+
+priced_df = selected_df[
+    selected_df["price_available"]
+].copy()
+
+if priced_df.empty:
+    st.info(
+        "No priced holdings to chart yet. Add holdings and click "
+        "'Refresh Prices' to load market prices."
+    )
+
+else:
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("### Allocation by stock")
+
+        allocation = (
+            priced_df.groupby("ticker", as_index=False)["market_value"]
+            .sum()
+            .sort_values("market_value", ascending=False)
         )
 
-        tx_options = {
-            (
-                f"ID {row['id']} · {row['client_name']} · "
-                f"{row['ticker']} · {row['transaction_type']} · "
-                f"{row['trade_date']}"
-            ): int(row["id"])
-            for row in history.to_dict("records")
-        }
-
-        chosen_tx = st.selectbox(
-            "Transaction to delete",
-            list(tx_options.keys()),
-        )
-        confirm_delete = st.checkbox(
-            "I confirm I want to permanently delete this transaction."
+        fig = px.treemap(
+            allocation,
+            path=["ticker"],
+            values="market_value",
+            color="market_value",
+            color_continuous_scale="Blues",
         )
 
-        if st.button("Delete transaction", type="secondary"):
-            if not confirm_delete:
-                st.error("Confirm the deletion first.")
+        fig.update_layout(
+            margin=dict(t=10, l=5, r=5, b=5),
+            height=380,
+            coloraxis_showscale=False,
+        )
+
+        fig.update_traces(
+            texttemplate="%{label}<br>₹%{value:,.0f}",
+            textfont_size=13,
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col2:
+        st.markdown("### Invested vs current value")
+
+        comparison = (
+            priced_df.groupby("ticker", as_index=False)
+            .agg(
+                Invested=("invested", "sum"),
+                CurrentValue=("market_value", "sum"),
+            )
+        )
+
+        comparison = comparison.sort_values(
+            "CurrentValue", ascending=True
+        ).tail(12)
+
+        comparison_long = comparison.melt(
+            id_vars="ticker",
+            value_vars=["Invested", "CurrentValue"],
+            var_name="Type",
+            value_name="Value",
+        )
+
+        fig = px.bar(
+            comparison_long,
+            x="Value",
+            y="ticker",
+            color="Type",
+            barmode="group",
+            orientation="h",
+            color_discrete_map={
+                "Invested": "#94A3B8",
+                "CurrentValue": "#2563EB",
+            },
+        )
+
+        fig.update_layout(
+            height=380,
+            margin=dict(t=10, l=5, r=5, b=5),
+            legend_title_text="",
+            yaxis_title="",
+            xaxis_title="Value (INR)",
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
+
+    col3, col4 = st.columns(2)
+
+    with col3:
+        st.markdown("### Profit and loss by stock")
+
+        stock_pnl = (
+            priced_df.groupby("ticker", as_index=False)["pnl"]
+            .sum()
+            .sort_values("pnl", ascending=True)
+        )
+
+        stock_pnl["Color"] = stock_pnl["pnl"].apply(
+            lambda x: "Profit" if x >= 0 else "Loss"
+        )
+
+        fig = px.bar(
+            stock_pnl,
+            x="pnl",
+            y="ticker",
+            orientation="h",
+            color="Color",
+            color_discrete_map={
+                "Profit": GREEN,
+                "Loss": RED,
+            },
+        )
+
+        fig.update_layout(
+            height=350,
+            margin=dict(t=10, l=5, r=5, b=5),
+            showlegend=False,
+            xaxis_title="Unrealized P&L (INR)",
+            yaxis_title="",
+        )
+
+        fig.add_vline(x=0, line_color="#64748B")
+
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col4:
+        st.markdown("### Client portfolio value")
+
+        if selected_client_name == "All Clients":
+            client_values = (
+                priced_df.groupby("client_name", as_index=False)
+                ["market_value"].sum()
+                .sort_values("market_value", ascending=True)
+            )
+
+            fig = px.bar(
+                client_values,
+                x="market_value",
+                y="client_name",
+                orientation="h",
+                color="market_value",
+                color_continuous_scale="Blues",
+            )
+
+            fig.update_layout(
+                height=350,
+                margin=dict(t=10, l=5, r=5, b=5),
+                coloraxis_showscale=False,
+                xaxis_title="Current Value (INR)",
+                yaxis_title="",
+            )
+
+            st.plotly_chart(fig, use_container_width=True)
+
+        else:
+            st.info(
+                "Select All Clients to compare portfolio values "
+                "across clients."
+            )
+
+
+# =========================================================
+# CLIENT PORTFOLIO TABLE
+# =========================================================
+
+st.markdown("## Client portfolio summary")
+
+if selected_client_name == "All Clients":
+    if portfolio_df.empty:
+        st.info("No holdings added yet.")
+    else:
+        summary = (
+            portfolio_df.groupby("client_name", as_index=False)
+            .agg(
+                Holdings=("ticker", "count"),
+                Invested=("invested", "sum"),
+                PricedHoldings=("price_available", "sum"),
+                CurrentValue=("market_value", "sum"),
+                PnL=("pnl", "sum"),
+            )
+        )
+
+        summary["Return %"] = (
+            summary["PnL"]
+            / summary["Invested"].replace(0, float("nan"))
+            * 100
+        )
+
+        summary["Missing Prices"] = (
+            summary["Holdings"] - summary["PricedHoldings"]
+        )
+
+        summary = summary.rename(
+            columns={
+                "client_name": "Client",
+                "Holdings": "Stocks",
+                "Invested": "Invested Capital",
+                "CurrentValue": "Priced Market Value",
+                "PnL": "Unrealized P&L",
+            }
+        )
+
+        display_cols = [
+            "Client",
+            "Stocks",
+            "Invested Capital",
+            "Priced Market Value",
+            "Unrealized P&L",
+            "Return %",
+            "Missing Prices",
+        ]
+
+        st.dataframe(
+            summary[display_cols],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Invested Capital": st.column_config.NumberColumn(
+                    format="₹%.2f"
+                ),
+                "Priced Market Value": st.column_config.NumberColumn(
+                    format="₹%.2f"
+                ),
+                "Unrealized P&L": st.column_config.NumberColumn(
+                    format="₹%.2f"
+                ),
+                "Return %": st.column_config.NumberColumn(
+                    format="%.2f%%"
+                ),
+            },
+        )
+
+else:
+    st.caption(f"Detailed holdings for {selected_client_name}")
+
+    if selected_df.empty:
+        st.info("This client has no holdings yet.")
+    else:
+        detail = selected_df[
+            [
+                "ticker",
+                "quantity",
+                "average_cost",
+                "current_price",
+                "invested",
+                "market_value",
+                "pnl",
+                "return_pct",
+                "price_available",
+            ]
+        ].copy()
+
+        detail = detail.rename(
+            columns={
+                "ticker": "Stock",
+                "quantity": "Quantity",
+                "average_cost": "Average Cost",
+                "current_price": "Current Price",
+                "invested": "Invested",
+                "market_value": "Market Value",
+                "pnl": "Unrealized P&L",
+                "return_pct": "Return %",
+                "price_available": "Price Available",
+            }
+        )
+
+        st.dataframe(
+            detail,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Average Cost": st.column_config.NumberColumn(
+                    format="₹%.2f"
+                ),
+                "Current Price": st.column_config.NumberColumn(
+                    format="₹%.2f"
+                ),
+                "Invested": st.column_config.NumberColumn(
+                    format="₹%.2f"
+                ),
+                "Market Value": st.column_config.NumberColumn(
+                    format="₹%.2f"
+                ),
+                "Unrealized P&L": st.column_config.NumberColumn(
+                    format="₹%.2f"
+                ),
+                "Return %": st.column_config.NumberColumn(
+                    format="%.2f%%"
+                ),
+            },
+        )
+
+    if not selected_df.empty:
+        export = selected_df.copy()
+        csv = export.to_csv(index=False).encode("utf-8")
+
+        st.download_button(
+            "Download client holdings CSV",
+            data=csv,
+            file_name="client_holdings.csv",
+            mime="text/csv",
+        )
+
+
+# =========================================================
+# CLIENT MANAGEMENT
+# =========================================================
+
+st.divider()
+st.markdown("## Client management")
+
+with st.expander("+ Add a new client"):
+    with st.form("add_client_form", clear_on_submit=True):
+        new_name = st.text_input("Client name *")
+        new_email = st.text_input("Email (optional)")
+        new_phone = st.text_input("Phone (optional)")
+        new_notes = st.text_area("Notes (optional)")
+
+        add_client = st.form_submit_button(
+            "Create client",
+            type="primary",
+        )
+
+        if add_client:
+            if not new_name.strip():
+                st.error("Client name is required.")
             else:
                 try:
-                    delete_transaction(tx_options[chosen_tx])
-                    st.success("Transaction deleted.")
+                    with get_connection() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """
+                                INSERT INTO clients
+                                    (name, email, phone, notes, is_archived)
+                                VALUES (%s, %s, %s, %s, FALSE)
+                                RETURNING id;
+                                """,
+                                (
+                                    new_name.strip(),
+                                    new_email.strip() or None,
+                                    new_phone.strip() or None,
+                                    new_notes.strip() or None,
+                                ),
+                            )
+                            new_id = cur.fetchone()["id"]
+
+                    audit(
+                        "CLIENT_CREATED",
+                        "client",
+                        new_id,
+                        {"name": new_name.strip()},
+                    )
+
+                    st.success("Client created.")
                     st.rerun()
+
                 except Exception as exc:
                     st.error(
-                        "Deletion failed or made the remaining ledger "
-                        f"invalid. Check transaction dates and quantities. {exc}"
+                        "Could not create client. "
+                        "Check whether the email already exists or "
+                        f"whether the database rejected the operation ({type(exc).__name__})."
                     )
 
 
-def page_client_portfolio():
-    st.title("📁 Client Portfolio")
-
-    clients = get_clients()
-    if clients.empty:
-        st.info("Create an active client first.")
-        return
-
-    client_map = {
-        f"{row['name']} (ID {row['id']})": int(row["id"])
-        for row in clients.to_dict("records")
-    }
-
-    label = st.selectbox("Select client", list(client_map.keys()))
-    client_id = client_map[label]
-
-    holdings = build_holdings(client_id)
-    transactions = get_transactions(client_id)
-
-    render_portfolio_dashboard(
-        holdings,
-        transactions,
-        title=label,
-    )
-
-    st.subheader("Client reports")
-    col1, col2 = st.columns(2)
-    with col1:
-        csv_download(
-            holdings,
-            f"client_{client_id}_holdings.csv",
-            "Download holdings CSV",
-        )
-    with col2:
-        excel_download(
-            holdings,
-            transactions,
-            f"client_{client_id}_report.xlsx",
-            "Download Excel report",
+if not active_clients.empty:
+    with st.expander("Edit or archive a client"):
+        chosen_client_name = st.selectbox(
+            "Choose client",
+            active_clients["name"].tolist(),
+            key="manage_client_select",
         )
 
+        chosen = active_clients[
+            active_clients["name"] == chosen_client_name
+        ].iloc[0]
 
-def page_reports():
-    st.title("📑 Reports and Data Quality")
-
-    clients = get_clients(include_archived=True)
-    holdings = build_holdings()
-    transactions = get_transactions()
-
-    st.subheader("Price status")
-    if holdings.empty:
-        st.info("No open holdings to report.")
-    else:
-        price_status = holdings[
-            [
-                "client_name", "ticker", "quantity",
-                "price_status", "price_date", "price_message",
-            ]
-        ]
-        st.dataframe(
-            price_status,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        missing = holdings[holdings["price_status"] != "OK"]
-        if not missing.empty:
-            st.warning(
-                f"{len(missing)} open holding(s) have missing or stale "
-                "prices and are excluded from current market-value totals."
+        with st.form("edit_client_form"):
+            edit_name = st.text_input(
+                "Name",
+                value=str(chosen["name"] or ""),
+            )
+            edit_email = st.text_input(
+                "Email",
+                value=str(chosen["email"] or ""),
+            )
+            edit_phone = st.text_input(
+                "Phone",
+                value=str(chosen["phone"] or ""),
+            )
+            edit_notes = st.text_area(
+                "Notes",
+                value=str(chosen["notes"] or ""),
             )
 
-    st.subheader("Export")
-    col1, col2 = st.columns(2)
-    with col1:
-        csv_download(
-            transactions,
-            "wealth_desk_transactions.csv",
-            "Download transaction ledger CSV",
+            save_client = st.form_submit_button("Save changes")
+            archive_client = st.form_submit_button("Archive client")
+
+            if save_client:
+                if not edit_name.strip():
+                    st.error("Name cannot be empty.")
+                else:
+                    with get_connection() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """
+                                UPDATE clients
+                                SET name=%s, email=%s, phone=%s, notes=%s
+                                WHERE id=%s;
+                                """,
+                                (
+                                    edit_name.strip(),
+                                    edit_email.strip() or None,
+                                    edit_phone.strip() or None,
+                                    edit_notes.strip() or None,
+                                    chosen["id"],
+                                ),
+                            )
+
+                    audit(
+                        "CLIENT_UPDATED",
+                        "client",
+                        chosen["id"],
+                        {"name": edit_name.strip()},
+                    )
+
+                    st.success("Client updated.")
+                    st.rerun()
+
+            if archive_client:
+                with get_connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            UPDATE clients
+                            SET is_archived = TRUE
+                            WHERE id = %s;
+                            """,
+                            (chosen["id"],),
+                        )
+
+                audit(
+                    "CLIENT_ARCHIVED",
+                    "client",
+                    chosen["id"],
+                    {"name": chosen["name"]},
+                )
+
+                st.success("Client archived.")
+                st.rerun()
+
+
+# =========================================================
+# HOLDINGS MANAGEMENT
+# =========================================================
+
+st.markdown("## Holdings management")
+
+if active_clients.empty:
+    st.info("Create a client before adding holdings.")
+
+else:
+    with st.expander("+ Add or update a stock holding"):
+        with st.form("holding_form", clear_on_submit=True):
+            holding_client = st.selectbox(
+                "Client",
+                active_clients["name"].tolist(),
+            )
+
+            ticker_input = st.text_input(
+                "Stock symbol",
+                placeholder="RELIANCE.NS or RELIANCE",
+                help="For NSE, enter RELIANCE.NS or RELIANCE. "
+                     "A bare symbol defaults to .NS.",
+            )
+
+            quantity_input = st.number_input(
+                "Current quantity held",
+                min_value=0.000001,
+                value=1.0,
+                step=1.0,
+                format="%.6f",
+            )
+
+            average_cost_input = st.number_input(
+                "Average purchase price (₹)",
+                min_value=0.0,
+                value=100.0,
+                step=1.0,
+                format="%.4f",
+            )
+
+            save_holding = st.form_submit_button(
+                "Save holding",
+                type="primary",
+            )
+
+            if save_holding:
+                if not ticker_input.strip():
+                    st.error("Stock symbol is required.")
+                elif quantity_input <= 0:
+                    st.error("Quantity must be greater than zero.")
+                else:
+                    normalized = normalize_ticker(ticker_input)
+
+                    client_row = active_clients[
+                        active_clients["name"] == holding_client
+                    ].iloc[0]
+
+                    with get_connection() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """
+                                INSERT INTO wealth_holdings
+                                    (client_id, ticker, quantity, average_cost)
+                                VALUES (%s, %s, %s, %s)
+                                ON CONFLICT (client_id, ticker)
+                                DO UPDATE SET
+                                    quantity = EXCLUDED.quantity,
+                                    average_cost = EXCLUDED.average_cost,
+                                    updated_at = NOW()
+                                RETURNING id;
+                                """,
+                                (
+                                    client_row["id"],
+                                    normalized,
+                                    quantity_input,
+                                    average_cost_input,
+                                ),
+                            )
+                            holding_id = cur.fetchone()["id"]
+
+                    audit(
+                        "HOLDING_UPSERTED",
+                        "holding",
+                        holding_id,
+                        {
+                            "client": holding_client,
+                            "ticker": normalized,
+                            "quantity": quantity_input,
+                            "average_cost": average_cost_input,
+                        },
+                    )
+
+                    st.success(
+                        f"Saved {normalized} for {holding_client}."
+                    )
+                    st.rerun()
+
+
+with st.expander("Edit or remove an existing holding"):
+    if holdings_df.empty:
+        st.info("No holdings exist yet.")
+    else:
+        holding_labels = (
+            holdings_df["client_name"].astype(str)
+            + " · "
+            + holdings_df["ticker"].astype(str)
         )
-    with col2:
-        excel_download(
-            holdings,
-            transactions,
-            "wealth_desk_full_report.xlsx",
-            "Download full Excel report",
+
+        chosen_label = st.selectbox(
+            "Select holding",
+            holding_labels.tolist(),
         )
 
+        chosen_index = holding_labels[
+            holding_labels == chosen_label
+        ].index[0]
 
-# ============================================================
-# 11. MAIN
-# ============================================================
+        chosen_holding = holdings_df.loc[chosen_index]
 
-def main():
-    if not st.session_state.get("authenticated", False):
-        login_screen()
-        return
+        with st.form("edit_holding_form"):
+            edit_qty = st.number_input(
+                "Quantity",
+                min_value=0.000001,
+                value=float(chosen_holding["quantity"]),
+                step=1.0,
+                format="%.6f",
+            )
 
-    # Initialize tables after authentication so an unauthenticated visitor
-    # cannot trigger database initialization through the UI.
-    try:
-        init_database()
-    except Exception as exc:
-        st.error(f"Database connection failed: {type(exc).__name__}")
-        st.code(str(exc))
-        st.stop()
+            edit_cost = st.number_input(
+                "Average purchase price",
+                min_value=0.0,
+                value=float(chosen_holding["average_cost"]),
+                step=1.0,
+                format="%.4f",
+            )
 
-    with st.sidebar:
-        st.title("📊 Wealth Desk")
-        st.caption("Portfolio management")
-        page = st.radio(
-            "Navigation",
-            [
-                "Overview",
-                "Client Management",
-                "Transactions",
-                "Client Portfolio",
-                "Reports & Data Quality",
-            ],
+            update_holding = st.form_submit_button("Update holding")
+            remove_holding = st.form_submit_button("Remove holding")
+
+            if update_holding:
+                with get_connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            UPDATE wealth_holdings
+                            SET quantity=%s,
+                                average_cost=%s,
+                                updated_at=NOW()
+                            WHERE id=%s;
+                            """,
+                            (
+                                edit_qty,
+                                edit_cost,
+                                chosen_holding["id"],
+                            ),
+                        )
+
+                audit(
+                    "HOLDING_UPDATED",
+                    "holding",
+                    chosen_holding["id"],
+                    {
+                        "quantity": edit_qty,
+                        "average_cost": edit_cost,
+                    },
+                )
+
+                st.success("Holding updated.")
+                st.rerun()
+
+            if remove_holding:
+                with get_connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            DELETE FROM wealth_holdings
+                            WHERE id=%s;
+                            """,
+                            (chosen_holding["id"],),
+                        )
+
+                audit(
+                    "HOLDING_REMOVED",
+                    "holding",
+                    chosen_holding["id"],
+                    {"ticker": chosen_holding["ticker"]},
+                )
+
+                st.success("Holding removed.")
+                st.rerun()
+
+
+# =========================================================
+# PRESENTATION MODE
+# =========================================================
+
+st.divider()
+
+with st.expander("Presentation mode"):
+    st.write(
+        "Use this view when explaining a portfolio to a prospective "
+        "client. It displays calculated values from your current holdings "
+        "and cached market prices."
+    )
+
+    presentation = st.checkbox(
+        "Enable presentation view",
+        key="presentation_view",
+    )
+
+    if presentation:
+        st.markdown("### Portfolio performance summary")
+        st.caption(
+            "Figures reflect current holdings and the latest available "
+            "cached prices. Returns are unrealized, not guaranteed."
         )
 
-        st.divider()
-        st.caption("All figures in INR unless stated otherwise.")
-        if st.button("Log out", use_container_width=True):
-            st.session_state["authenticated"] = False
-            st.rerun()
+        p1, p2, p3 = st.columns(3)
 
-    try:
-        if page == "Overview":
-            page_overview()
-        elif page == "Client Management":
-            page_clients()
-        elif page == "Transactions":
-            page_transactions()
-        elif page == "Client Portfolio":
-            page_client_portfolio()
-        elif page == "Reports & Data Quality":
-            page_reports()
-    except Exception:
-        st.error(
-            "The page could not be loaded. Check the database connection "
-            "and transaction history. If the problem persists, inspect "
-            "the Streamlit application logs."
+        p1.metric(
+            "Portfolio Value",
+            money(totals["market_value"]),
+        )
+        p2.metric(
+            "Invested Capital",
+            money(totals["invested"]),
+        )
+        p3.metric(
+            "Unrealized P&L",
+            signed_money(totals["pnl"]),
+            signed_pct(totals["return_pct"]),
         )
 
+        if not priced_df.empty:
+            presentation_alloc = (
+                priced_df.groupby("ticker", as_index=False)
+                ["market_value"].sum()
+                .sort_values("market_value", ascending=False)
+            )
 
-if __name__ == "__main__":
-    main()
+            fig = px.bar(
+                presentation_alloc,
+                x="ticker",
+                y="market_value",
+                color="market_value",
+                color_continuous_scale="Blues",
+            )
+
+            fig.update_layout(
+                title="Current holdings by market value",
+                showlegend=False,
+                coloraxis_showscale=False,
+                xaxis_title="Stock",
+                yaxis_title="Market value (INR)",
+            )
+
+            st.plotly_chart(fig, use_container_width=True)
+
+st.caption(
+    "Wealth Desk · Portfolio values depend on available market prices. "
+    "Market data may be delayed. This dashboard does not execute trades."
+)
