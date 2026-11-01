@@ -349,18 +349,35 @@ def refresh_ui():
 
 
 # ============================================================ authentication
+def _secret(*names):
+    try: sec = dict(st.secrets.get("auth", {}))
+    except Exception: sec = {}
+    for src in (sec, st.secrets):
+        for n in names:
+            try: v = src.get(n)
+            except Exception: v = None
+            if v: return str(v)
+    return None
+
+
 def login_ok(user: str, pw: str):
-    try:
-        sec = st.secrets["auth"]; u, h = sec["username"], str(sec["password_hash"]).strip()
-    except Exception:
-        log.error("AUTH CONFIG ERROR: [auth] username/password_hash missing"); return False, "config"
+    """Returns (ok, error). error: None | 'invalid' | 'config:<reason>'"""
+    u = _secret("username", "ADMIN_USERNAME")
+    h = _secret("password_hash", "ADMIN_PASSWORD_HASH")
+    if not u:
+        return False, "config:username is missing under [auth]"
+    if not h:
+        return False, "config:password_hash is missing under [auth]"
+    h = re.sub(r"\s+", "", h).strip("\"'")
     if not re.match(r"^\$2[abxy]\$\d{2}\$[./A-Za-z0-9]{53}$", h):
-        log.error("AUTH CONFIG ERROR: password_hash is not a valid bcrypt hash"); return False, "config"
+        log.error("AUTH CONFIG ERROR: invalid bcrypt hash (length %d)", len(h))
+        return False, f"config:password_hash is not a valid bcrypt hash (length {len(h)}, expected 60, must start with $2b$)"
     import bcrypt
     pw_ok = bcrypt.checkpw((pw or "").encode()[:72], h.encode())
-    if hmac.compare_digest((user or "").encode(), u.encode()) and pw_ok: return True, None
-    log.warning("AUTH FAILURE: invalid credentials"); return False, "invalid"
-
+    if hmac.compare_digest((user or "").encode(), u.strip().encode()) and pw_ok:
+        return True, None
+    log.warning("AUTH FAILURE: invalid credentials")
+    return False, "invalid"
 
 def authed() -> bool:
     s = st.session_state
