@@ -10,6 +10,8 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+import os
+HAS_CLIENT_PAGE = os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), "pages", "Client_Details.py"))
 
 log = logging.getLogger("stackwealth")
 APP_NAME = "StackWealth Dashboard"
