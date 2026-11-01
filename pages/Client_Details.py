@@ -12,8 +12,33 @@ PHONE = re.compile(r"^\+?[0-9][0-9 \-()]{6,18}$")
 
 
 def audit(conn, action, entity_id, details):
-    conn.execute("INSERT INTO sw_audit_log(actor,action,entity,entity_id,details) VALUES (%s,%s,'client',%s,%s::jsonb)",
-                 (st.session_state.get("sw_user", "admin"), action, str(entity_id), json.dumps(details, default=str)))
+    payload = dict(details or {})
+    payload["actor"] = st.session_state.get(
+        "sw_user",
+        "admin",
+    )
+
+    conn.execute(
+        """
+        INSERT INTO audit_logs (
+            action,
+            entity_type,
+            entity_id,
+            details
+        )
+        VALUES (%s, %s, %s, %s::jsonb)
+        """,
+        (
+            action,
+            (
+                "holding"
+                if action.startswith("holding.")
+                else "client"
+            ),
+            int(entity_id) if entity_id is not None else None,
+            json.dumps(payload, default=str),
+        ),
+    )
 
 
 def clean_contact(name, email, phone, notes):
