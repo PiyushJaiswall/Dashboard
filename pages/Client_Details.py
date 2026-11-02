@@ -190,8 +190,9 @@ def page():
 
         present = st.toggle(
             "Presentation mode",
+            value=True,
             key="client_presentation_mode",
-            help="Hides client editing controls and contact details.",
+            help="ON: clean presentation view. OFF: show holdings, client editing and management controls."
         )
 
         home_page = st.session_state.get("_sw_home_page")
