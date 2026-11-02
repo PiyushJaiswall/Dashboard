@@ -237,10 +237,26 @@ def short(symbol):
 
 def cap_bucket(market_cap_inr=None):
     """
-    Do not guess AMFI market-cap classifications from a raw
-    market-cap value. Use verified classifications only.
+    Approximate Indian equity market-cap categories.
+
+    These are practical size thresholds, not official AMFI rankings.
+    Official classifications depend on the stock's market-cap rank.
     """
-    return "Unclassified"
+    market_cap = number(market_cap_inr)
+
+    if market_cap is None or market_cap <= 0:
+        return "Unclassified"
+
+    # Market capitalization is expressed in INR.
+    # ₹20,000 crore = ₹200 billion.
+    # ₹5,000 crore = ₹50 billion.
+    if market_cap >= 200_000_000_000:
+        return "Large Cap"
+
+    if market_cap >= 50_000_000_000:
+        return "Mid Cap"
+
+    return "Small Cap"
 
 
 # ============================================================
@@ -319,17 +335,17 @@ def enrich(rows):
         if not isinstance(diagnostics, dict):
             diagnostics = {}
 
-        cap = diagnostics.get(
-            "cap_category",
-            "Unclassified",
-        )
-
-        if cap not in (
-            "Large Cap",
-            "Mid Cap",
-            "Small Cap",
-        ):
-            cap = "Unclassified"
+       # Use an existing valid category if one is available.
+        cap = str(
+            diagnostics.get("cap_category") or ""
+        ).strip().title()
+        
+        if cap not in ("Large Cap", "Mid Cap", "Small Cap"):
+            # The refresh function stores Yahoo Finance marketCap
+            # in diagnostics["market_cap"], expressed in INR.
+            cap = cap_bucket(
+                diagnostics.get("market_cap")
+            )
 
         output.append(
             {
@@ -2506,14 +2522,13 @@ def home_page():
 
     sidebar()
 
-    # Load the complete portfolio and the active-client directory.
+    # Load consolidated portfolio and active clients.
     positions = load_positions()
     active_clients = load_active_clients()
-
     closes = st.session_state.get("closes")
 
     # --------------------------------------------------------
-    # Main heading
+    # PAGE HEADING
     # --------------------------------------------------------
 
     st.markdown(
@@ -2530,12 +2545,10 @@ def home_page():
     )
 
     # --------------------------------------------------------
-    # Search and actions
+    # SEARCH AND ACTIONS
     # --------------------------------------------------------
 
-    search_col, action_col = st.columns(
-        [4, 1.25]
-    )
+    search_col, action_col = st.columns([4, 1.25])
 
     with search_col:
         query = st.text_input(
@@ -2554,18 +2567,13 @@ def home_page():
             refresh_ui()
 
     if st.session_state.get("refresh_msg"):
-        st.caption(
-            st.session_state["refresh_msg"]
-        )
+        st.caption(st.session_state["refresh_msg"])
 
     # --------------------------------------------------------
-    # Build consolidated metrics
+    # CONSOLIDATED METRICS
     # --------------------------------------------------------
 
-    chips(
-        positions,
-        closes,
-    )
+    chips(positions, closes)
 
     portfolio = totals(positions)
 
@@ -2582,9 +2590,7 @@ def home_page():
 
     # Historical estimate based on current quantities.
     series = value_series(
-        positions[
-            positions["priced"].astype(bool)
-        ],
+        positions[positions["priced"].astype(bool)],
         closes,
     )
 
@@ -2613,26 +2619,19 @@ def home_page():
     if portfolio["n_priced"]:
         status += (
             "Unrealized P&L "
-            + fmt_inr(
-                portfolio["pnl"],
-                sign=True,
-            )
+            + fmt_inr(portfolio["pnl"], sign=True)
             + " ("
             + pct(portfolio["ret"])
             + ")"
         )
     else:
-        status += (
-            "No prices loaded — invested capital shown"
-        )
+        status += "No prices loaded — invested capital shown"
 
     # --------------------------------------------------------
-    # Hero portfolio value and KPIs
+    # PORTFOLIO VALUE AND KPI CARDS
     # --------------------------------------------------------
 
-    left, right = st.columns(
-        [2.3, 5.2]
-    )
+    left, right = st.columns([2.3, 5.2])
 
     with left:
         st.markdown(
@@ -2689,10 +2688,7 @@ def home_page():
             (
                 "Unrealized P&L",
                 (
-                    fmt_inr(
-                        portfolio["pnl"],
-                        sign=True,
-                    )
+                    fmt_inr(portfolio["pnl"], sign=True)
                     if portfolio["n_priced"]
                     else "—"
                 ),
@@ -2717,20 +2713,15 @@ def home_page():
             ),
         ]
 
-        for column, args in zip(
-            st.columns(5),
-            first_row,
-        ):
+        for column, args in zip(st.columns(5), first_row):
             column.markdown(
                 card(*args),
                 unsafe_allow_html=True,
             )
 
-        # Calculate stock-level gainers and losers.
+        # Stock-level gainers and losers.
         positions_by_symbol = (
-            positions[
-                positions["priced"].astype(bool)
-            ]
+            positions[positions["priced"].astype(bool)]
             .groupby("sym")
             .agg(
                 PnL=("PnL", "sum"),
@@ -2746,7 +2737,7 @@ def home_page():
             positions_by_symbol["PnL"] < 0
         ]
 
-        # Clients with a return figure.
+        # Clients with a calculated return.
         clients_with_returns = directory.dropna(
             subset=["Return %"]
         )
@@ -2767,10 +2758,7 @@ def home_page():
             else None
         )
 
-        top5, hhi = concentration(
-            positions,
-            basis,
-        )
+        top5, hhi = concentration(positions, basis)
 
         second_row = [
             (
@@ -2809,10 +2797,7 @@ def home_page():
                     else "—"
                 ),
                 (
-                    fmt_inr(
-                        gainers["PnL"].max(),
-                        sign=True,
-                    )
+                    fmt_inr(gainers["PnL"].max(), sign=True)
                     if not gainers.empty
                     else ""
                 ),
@@ -2826,10 +2811,7 @@ def home_page():
                     else "—"
                 ),
                 (
-                    fmt_inr(
-                        losers["PnL"].min(),
-                        sign=True,
-                    )
+                    fmt_inr(losers["PnL"].min(), sign=True)
                     if not losers.empty
                     else ""
                 ),
@@ -2837,9 +2819,7 @@ def home_page():
             ),
             (
                 "Invested (priced)",
-                fmt_inr(
-                    portfolio["invested_priced"]
-                ),
+                fmt_inr(portfolio["invested_priced"]),
                 "P&L denominator",
                 TEXT,
             ),
@@ -2850,17 +2830,14 @@ def home_page():
             unsafe_allow_html=True,
         )
 
-        for column, args in zip(
-            st.columns(5),
-            second_row,
-        ):
+        for column, args in zip(st.columns(5), second_row):
             column.markdown(
                 card(*args),
                 unsafe_allow_html=True,
             )
 
     # --------------------------------------------------------
-    # Missing price warning
+    # MISSING PRICE WARNING
     # --------------------------------------------------------
 
     if portfolio["n_priced"] < portfolio["n"]:
@@ -2872,39 +2849,48 @@ def home_page():
             f"{fmt_inr(portfolio['invested_priced'])}."
         )
 
-    # --------------------------------------------------------
-    # Allocation and benchmark panels
-    # --------------------------------------------------------
+    # ========================================================
+    # ROW 1: STOCK ALLOCATION + SECTOR-TO-STOCK TREEMAP
+    # Equal-width columns (50/50).
+    # ========================================================
 
-    column1, column2, column3 = st.columns(
-        [1.15, 1.25, 1.7]
+    allocation_col, treemap_col = st.columns(
+        [1, 1],
+        gap="medium",
     )
 
-    with column1, st.container(border=True):
-        ctitle("Allocation by stock")
+    with allocation_col:
+        with st.container(border=True):
+            ctitle("Allocation by stock")
 
-        show(
-            donut_fig(
-                positions,
-                "sym",
-                basis,
-                h=340,
-            ),
-            "Add stock holdings to view allocation.",
-        )
+            show(
+                donut_fig(
+                    positions,
+                    "sym",
+                    basis,
+                    h=360,
+                ),
+                "Add stock holdings to view allocation.",
+            )
 
-    with column2, st.container(border=True):
-        ctitle("Sector-to-stock treemap")
+    with treemap_col:
+        with st.container(border=True):
+            ctitle("Sector-to-stock treemap")
 
-        show(
-            treemap_fig(
-                positions,
-                340,
-            ),
-            "Add stock holdings to view the treemap.",
-        )
+            show(
+                treemap_fig(
+                    positions,
+                    360,
+                ),
+                "Add stock holdings to view the treemap.",
+            )
 
-    with column3, st.container(border=True):
+    # ========================================================
+    # ROW 2: PERFORMANCE COMPARISON
+    # Full width.
+    # ========================================================
+
+    with st.container(border=True):
         bench_card(
             positions,
             closes,
@@ -2912,119 +2898,140 @@ def home_page():
             "Combined portfolio",
         )
 
-    # --------------------------------------------------------
-    # Sector, market cap and concentration
-    # --------------------------------------------------------
+    # ========================================================
+    # ROW 3: SECTOR ALLOCATION + MARKET-CAP ALLOCATION
+    # Equal-width columns (50/50).
+    # ========================================================
 
-    column1, column2, column3, column4 = st.columns(
-        [1, 1, 0.8, 2]
+    sector_col, market_cap_col = st.columns(
+        [1, 1],
+        gap="medium",
     )
 
-    with column1, st.container(border=True):
-        ctitle("Sector allocation")
+    with sector_col:
+        with st.container(border=True):
+            ctitle("Sector allocation")
 
-        show(
-            donut_fig(
-                positions,
-                "Sector",
-                basis,
-                h=270,
-            ),
-            "Sector allocation is unavailable.",
-        )
-
-    with column2, st.container(border=True):
-        ctitle("Market-cap allocation")
-
-        show(
-            donut_fig(
-                positions,
-                "Cap",
-                basis,
-                h=270,
-            ),
-            "Market-cap classification is unavailable.",
-        )
-
-        st.caption(
-            "Only verified Large Cap, Mid Cap and Small Cap "
-            "classifications are used. Unknowns are not guessed."
-        )
-
-    with column3, st.container(border=True):
-        ctitle("Concentration")
-
-        show(
-            gauge_fig(top5),
-            "Add holdings to calculate concentration.",
-        )
-
-        st.caption(
-            (
-                f"Top-5 share · HHI {hhi:,.0f}"
-                if hhi is not None
-                else "No allocation available"
+            show(
+                donut_fig(
+                    positions,
+                    "Sector",
+                    basis,
+                    h=320,
+                ),
+                "Sector allocation is unavailable.",
             )
-        )
 
-    with column4, st.container(border=True):
-        render_client_directory(
-            directory,
-            query,
-        )
+    with market_cap_col:
+        with st.container(border=True):
+            ctitle("Market-cap allocation")
 
-    # --------------------------------------------------------
-    # Stock-level gainers and losers
-    # --------------------------------------------------------
+            show(
+                donut_fig(
+                    positions,
+                    "Cap",
+                    basis,
+                    h=320,
+                ),
+                "Market-cap classification is unavailable.",
+            )
 
-    column1, column2, column3 = st.columns(
-        [1.2, 1.2, 1.6]
+            st.caption(
+                "Only verified Large Cap, Mid Cap and Small Cap "
+                "classifications are used. Unknowns are not guessed."
+            )
+
+    # ========================================================
+    # ROW 4: PORTFOLIO CONCENTRATION + CLIENT DIRECTORY
+    # Equal-width columns (50/50).
+    # ========================================================
+
+    concentration_col, directory_col = st.columns(
+        [1, 1],
+        gap="medium",
+    )
+
+    with concentration_col:
+        with st.container(border=True):
+            ctitle("Portfolio concentration")
+
+            show(
+                gauge_fig(top5),
+                "Add holdings to calculate concentration.",
+            )
+
+            st.caption(
+                (
+                    f"Top-5 share · HHI {hhi:,.0f}"
+                    if hhi is not None
+                    else "No allocation available"
+                )
+            )
+
+    with directory_col:
+        with st.container(border=True):
+            render_client_directory(
+                directory,
+                query,
+            )
+
+    # ========================================================
+    # ROW 5: TOP GAINERS + TOP LOSERS + CLIENT P&L
+    # Preserves the existing three-card layout.
+    # ========================================================
+
+    gainers_col, losers_col, client_pnl_col = st.columns(
+        [1.2, 1.2, 1.6],
+        gap="medium",
     )
 
     for column, title, subset in (
         (
-            column1,
+            gainers_col,
             "Top gainers",
             gainers.nlargest(5, "PnL"),
         ),
         (
-            column2,
+            losers_col,
             "Top losers",
             losers.nsmallest(5, "PnL"),
         ),
     ):
-        with column, st.container(border=True):
-            ctitle(title)
+        with column:
+            with st.container(border=True):
+                ctitle(title)
 
-            st.dataframe(
-                subset.style.format(
-                    {
-                        "PnL": "₹{:+,.0f}",
-                        "Invested": "₹{:,.0f}",
-                    },
-                    na_rep="—",
-                ).map(
-                    tone_css,
-                    subset=["PnL"],
+                st.dataframe(
+                    subset.style.format(
+                        {
+                            "PnL": "₹{:+,.0f}",
+                            "Invested": "₹{:,.0f}",
+                        },
+                        na_rep="—",
+                    ).map(
+                        tone_css,
+                        subset=["PnL"],
+                    ),
+                    use_container_width=True,
+                )
+
+    with client_pnl_col:
+        with st.container(border=True):
+            ctitle("Unrealized P&L by client")
+
+            show(
+                pnl_bar_fig(
+                    directory["Client"],
+                    directory["P&L (priced)"],
+                    260,
                 ),
-                use_container_width=True,
+                "No priced client positions available.",
             )
 
-    with column3, st.container(border=True):
-        ctitle("Unrealized P&L by client")
-
-        show(
-            pnl_bar_fig(
-                directory["Client"],
-                directory["P&L (priced)"],
-                260,
-            ),
-            "No priced client positions available.",
-        )
-
-    # --------------------------------------------------------
-    # Invested vs market value
-    # --------------------------------------------------------
+    # ========================================================
+    # ROW 6: INVESTED VS CURRENT VALUE
+    # Full width.
+    # ========================================================
 
     with st.container(border=True):
         ctitle("Invested vs current value")
@@ -3034,9 +3041,9 @@ def home_page():
             "No priced positions available for comparison.",
         )
 
-    # --------------------------------------------------------
-    # Positions without prices
-    # --------------------------------------------------------
+    # ========================================================
+    # ROW 7: POSITIONS WITHOUT PRICES
+    # ========================================================
 
     missing_positions = positions[
         ~positions["priced"].astype(bool)
@@ -3058,9 +3065,9 @@ def home_page():
             use_container_width=True,
         )
 
-    # --------------------------------------------------------
-    # Export
-    # --------------------------------------------------------
+    # ========================================================
+    # ROW 8: DOWNLOAD REPORT
+    # ========================================================
 
     st.download_button(
         "Download portfolio report",
