@@ -140,10 +140,26 @@ def clean_contact(name, email, phone, notes):
 def positions_for(client_id) -> pd.DataFrame:
     """Load holdings belonging to one client."""
 
-    query = POS_SQL.replace(
-        "WHERE c.status='active'",
-        "WHERE c.id=%s",
-    )
+    query = """
+        SELECT
+            c.id AS client_id,
+            c.name AS client_name,
+            h.symbol,
+            h.quantity,
+            h.avg_price,
+            p.price,
+            p.price_date,
+            p.retrieved_at,
+            p.diagnostics,
+            p.source
+        FROM current_holdings h
+        JOIN clients c
+            ON c.id = h.client_id
+        LEFT JOIN price_cache p
+            ON p.symbol = h.symbol
+        WHERE c.id = %s
+        ORDER BY c.name, h.symbol
+    """
 
     with db() as conn:
         cursor = conn.execute(query, (client_id,))
